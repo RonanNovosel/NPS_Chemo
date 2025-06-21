@@ -1,0 +1,277 @@
+# Chemical Space Analysis of NPS Dataset
+# This tutorial visualizes and analyzes the chemical space of novel psychoactive substances
+
+import pandas as pd
+import numpy as np
+from rdkit import Chem
+from rdkit.Chem import Descriptors
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.express as px
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.manifold import TSNE
+import os
+
+# Create results directory
+os.makedirs('results', exist_ok=True)
+
+# Load the dataset
+try:
+    df = pd.read_csv('nps_dataset.csv')
+    required_columns = ['smiles', 'name', 'main_class', 'subclass']
+    if not all(col in df.columns for col in required_columns):
+        raise ValueError(f"Dataset must contain columns: {required_columns}")
+except FileNotFoundError:
+    print("Error: 'nps_dataset.csv' not found. Please provide the dataset.")
+    exit(1)
+except Exception as e:
+    print(f"Error loading dataset: {e}")
+    exit(1)
+
+print("=== STEP 1: Generate Molecular Descriptors ===")
+
+def calculate_frac_csp3(mol):
+    """Safe calculation of fraction sp3 carbons"""
+    try:
+        return Descriptors.FractionCsp3(mol)
+    except AttributeError:
+        carbon_atoms = [atom for atom in mol.GetAtoms() if atom.GetAtomicNum() == 6]
+        if not carbon_atoms:
+            return 0.0
+        sp3_carbons = [atom for atom in carbon_atoms if atom.GetHybridization() == Chem.HybridizationType.SP3]
+        return len(sp3_carbons) / len(carbon_atoms)
+
+def calculate_descriptors(smiles):
+    """Calculate Lipinski and forensically-relevant molecular descriptors"""
+    try:
+        mol = Chem.MolFromSmiles(smiles, sanitize=True)
+        if mol is None:
+            return None
+        Chem.SanitizeMol(mol)
+        descriptors = {
+            'MW': Descriptors.MolWt(mol),
+            'LogP': Descriptors.MolLogP(mol),
+            'HBD': Descriptors.NumHDonors(mol),
+            'HBA': Descriptors.NumHAcceptors(mol),
+            'TPSA': Descriptors.TPSA(mol),
+            'HeavyAtoms': Descriptors.HeavyAtomCount(mol),
+            'RotBonds': Descriptors.NumRotatableBonds(mol),
+            'AromaticRings': Descriptors.NumAromaticRings(mol),
+            'RingCount': Descriptors.RingCount(mol),
+            'MolMR': Descriptors.MolMR(mol),
+            'LabuteASA': Descriptors.LabuteASA(mol),
+            'BalabanJ': Descriptors.BalabanJ(mol),
+            'Chi0v': Descriptors.Chi0v(mol),
+            'NumSaturatedRings': Descriptors.NumSaturatedRings(mol),
+            'NumAliphaticRings': Descriptors.NumAliphaticRings(mol),
+            'FractionCsp3': calculate_frac_csp3(mol),
+            'MaxEStateIndex': Descriptors.MaxEStateIndex(mol),
+            'MinEStateIndex': Descriptors.MinEStateIndex(mol)
+        }
+        return descriptors
+    except Exception as e:
+        print(f"Error processing SMILES {smiles}: {e}")
+        return None
+
+# Calculate descriptors
+descriptor_data = []
+valid_indices = []
+invalid_smiles = []
+
+for i, smiles in enumerate(df['smiles']):
+    desc = calculate_descriptors(smiles)
+    if desc is not None:
+        descriptor_data.append(desc)
+        valid_indices.append(i)
+    else:
+        invalid_smiles.append((i, smiles, df.iloc[i]['name']))
+        print(f"Failed to process SMILES at index {i}: {smiles} ({df.iloc[i]['name']})")
+
+# Log invalid SMILES
+if invalid_smiles:
+    with open('results/invalid_smiles.txt', 'w') as f:
+        f.write("Index,SMILES,Name\n")
+        for idx, smiles, name in invalid_smiles:
+            f.write(f"{idx},{smiles},{name}\n")
+    print(f"Logged {len(invalid_smiles)} invalid SMILES to 'results/invalid_smiles.txt'")
+
+# Create descriptor DataFrame
+desc_df = pd.DataFrame(descriptor_data)
+print(f"Calculated descriptors for {len(desc_df)} compounds")
+print(desc_df.head())
+
+# Handle NaN or inf in descriptors
+desc_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+desc_df.dropna(inplace=True)
+valid_indices = desc_df.index.tolist()
+df_clean = df.iloc[valid_indices].reset_index(drop=True)
+desc_df = desc_df.reset_index(drop=True)
+
+# Merge descriptors with cleaned dataframe
+df_clean = pd.concat([df_clean, desc_df], axis=1)
+
+print("\n=== STEP 2: Principal Component Analysis (PCA) ===")
+
+# Standardize the descriptors
+scaler = StandardScaler()
+desc_scaled = scaler.fit_transform(desc_df)
+
+# Perform PCA
+pca = PCA(n_components=2)
+pca_result = pca.fit_transform(desc_scaled)
+
+# Add PCA results to dataframe
+df_clean['PC1'] = pca_result[:, 0]
+df_clean['PC2'] = pca_result[:, 1]
+
+print(f"PCA explained variance: PC1: {pca.explained_variance_ratio_[0]:.3f}, PC2: {pca.explained_variance_ratio_[1]:.3f}")
+print(f"Total variance explained: {pca.explained_variance_ratio_.sum():.3f}")
+
+print("\n=== STEP 2.1: PCA Descriptor Importance ===")
+
+# Get PCA loadings
+loadings = pd.DataFrame(
+    pca.components_.T,
+    columns=[f'PC{i+1}' for i in range(pca.n_components_)],
+    index=desc_df.columns
+)
+
+# Calculate absolute loadings for ranking
+loadings['PC1_abs'] = loadings['PC1'].abs()
+loadings['PC2_abs'] = loadings['PC2'].abs()
+
+# Print top 5 contributors for PC1 and PC2
+print("\nTop 5 descriptors contributing to PC1:")
+print(loadings[['PC1', 'PC1_abs']].sort_values(by='PC1_abs', ascending=False).head(5))
+print("\nTop 5 descriptors contributing to PC2:")
+print(loadings[['PC2', 'PC2_abs']].sort_values(by='PC2_abs', ascending=False).head(5))
+
+# Visualize loadings
+plt.figure(figsize=(12, 6))
+sns.barplot(x='PC1_abs', y=loadings.index, data=loadings.sort_values('PC1_abs', ascending=False))
+plt.title('Descriptor Contributions to PC1')
+plt.xlabel('Absolute Loading')
+plt.tight_layout()
+plt.savefig('results/pca_loadings_pc1.png', dpi=300)
+plt.show()
+
+plt.figure(figsize=(12, 6))
+sns.barplot(x='PC2_abs', y=loadings.index, data=loadings.sort_values('PC2_abs', ascending=False))
+plt.title('Descriptor Contributions to PC2')
+plt.xlabel('Absolute Loading')
+plt.tight_layout()
+plt.savefig('results/pca_loadings_pc2.png', dpi=300)
+plt.show()
+
+print("\n=== STEP 3: Visualizations ===")
+
+# 3.1 - PCA Scatter Plot with Matplotlib
+plt.figure(figsize=(12, 8))
+unique_classes = df_clean['main_class'].unique()
+colors = plt.cm.tab10(np.linspace(0, 1, len(unique_classes)))
+color_dict = dict(zip(unique_classes, colors))
+
+for class_name in unique_classes:
+    mask = df_clean['main_class'] == class_name
+    plt.scatter(df_clean[mask]['PC1'], df_clean[mask]['PC2'],
+                c=[color_dict[class_name]], label=class_name, alpha=0.7, s=60)
+
+plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)')
+plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)')
+plt.title('Chemical Space: PCA of NPS Dataset')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('results/pca_plot.png', dpi=300)
+plt.show()
+
+# 3.2 - Interactive Plotly visualization
+fig = px.scatter(df_clean, x='PC1', y='PC2',
+                 color='main_class',
+                 symbol='subclass',
+                 hover_data=['name', 'MW', 'LogP', 'TPSA'],
+                 title='Interactive Chemical Space Map',
+                 labels={'PC1': f'PC1 ({pca.explained_variance_ratio_[0]:.1%} variance)',
+                         'PC2': f'PC2 ({pca.explained_variance_ratio_[1]:.1%} variance)'})
+
+fig.update_layout(width=800, height=600)
+fig.write_html('results/pca_plotly.html')
+fig.show()
+
+print("\n=== STEP 4: t-SNE Analysis ===")
+
+# t-SNE for non-linear dimensionality reduction
+perplexity = min(30, len(desc_scaled) - 1)
+tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity)
+tsne_result = tsne.fit_transform(desc_scaled)
+
+df_clean['tSNE1'] = tsne_result[:, 0]
+df_clean['tSNE2'] = tsne_result[:, 1]
+
+# t-SNE visualization
+fig = px.scatter(df_clean, x='tSNE1', y='tSNE2',
+                 color='main_class',
+                 hover_data=['name', 'subclass'],
+                 title='t-SNE Chemical Space Visualization',
+                 width=800, height=600)
+fig.write_html('results/tsne_plotly.html')
+fig.show()
+
+print("\n=== STEP 5: Descriptor Analysis ===")
+
+# Correlation heatmap of descriptors
+plt.figure(figsize=(10, 8))
+correlation_matrix = desc_df.corr()
+sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', center=0,
+            square=True, fmt='.2f')
+plt.title('Molecular Descriptor Correlation Matrix')
+plt.tight_layout()
+plt.savefig('results/correlation_heatmap.png', dpi=300)
+plt.show()
+
+# Descriptor distribution by class
+fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+axes = axes.flatten()
+
+key_descriptors = ['MW', 'LogP', 'TPSA', 'HBD']
+for i, desc in enumerate(key_descriptors):
+    ax = axes[i]
+    for class_name in df_clean['main_class'].unique():
+        mask = df_clean['main_class'] == class_name
+        values = desc_df[mask][desc]
+        ax.hist(values, alpha=0.6, label=class_name, bins=15)
+    
+    ax.set_xlabel(desc)
+    ax.set_ylabel('Frequency')
+    ax.set_title(f'{desc} Distribution by Class')
+    ax.legend()
+
+plt.tight_layout()
+plt.savefig('results/descriptor_distributions.png', dpi=300)
+plt.show()
+
+print("\n=== STEP 6: Summary Statistics ===")
+
+# Summary by class
+summary = df_clean.groupby('main_class').agg({
+    'name': 'count',
+    'MW': 'mean',
+    'LogP': 'mean',
+    'TPSA': 'mean'
+}).round(2)
+
+print("Summary statistics by drug class:")
+print(summary)
+
+print("\n=== Analysis Complete! ===")
+print("Key insights from the chemical space analysis:")
+print("1. PCA shows how compounds cluster by pharmacological class")
+print("2. t-SNE reveals non-linear relationships between structures")
+print("3. Descriptor analysis shows chemical property differences")
+print("4. Interactive plots allow detailed exploration of individual compounds")
+
+# Save results
+df_clean.to_csv('results/nps_with_descriptors.csv', index=False)
+desc_df.to_csv('results/molecular_descriptors.csv', index=False)
+print("\nResults saved to CSV files in results/ for further analysis!")
